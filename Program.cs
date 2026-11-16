@@ -106,6 +106,8 @@ internal class Program
             var stored = LoadStoredApiKey();
             if (stored != null)
             {
+                // Sanitize once so the validated key is the same one that gets sent later
+                stored = SanitizeApiKey(stored);
                 Console.Write("Testing stored API key... ");
                 if (await TestApiKey(stored))
                 {
@@ -347,7 +349,7 @@ internal class Program
             Write($"Output file already exists: ", ConsoleColor.Yellow);
             Console.WriteLine(outputPath);
             Console.Write("Overwrite? [Y/n]: ");
-            var answer = Console.ReadLine()?.Trim();
+            var answer = (await ReadLineAsync())?.Trim();
             if (string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(answer, "no", StringComparison.OrdinalIgnoreCase))
             {
@@ -547,36 +549,36 @@ internal class Program
                 Filter = "*.*"
             };
 
-            var tcs = new TaskCompletionSource<string?>();
-            var cts = new CancellationTokenSource();
+            var fileTcs = new TaskCompletionSource<string>();
 
-            watcher.Created += (_, e) => tcs.TrySetResult(e.FullPath);
+            watcher.Created += (_, e) => fileTcs.TrySetResult(e.FullPath);
 
             // Also check for files that already exist (dropped before watcher started)
             var existingFiles = Directory.GetFiles(stagingDir);
-
-            // Read console input in background
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    var line = Console.ReadLine();
-                    if (string.Equals(line?.Trim(), "skip", StringComparison.OrdinalIgnoreCase))
-                        tcs.TrySetResult(null);
-                }
-                catch
-                {
-                    tcs.TrySetResult(null);
-                }
-            });
-
-            // If files already exist, pick first one
             if (existingFiles.Length > 0)
-            {
-                tcs.TrySetResult(existingFiles[0]);
-            }
+                fileTcs.TrySetResult(existingFiles[0]);
 
-            var filePath = await tcs.Task;
+            // Wait for either a dropped file or a typed "skip". Console input goes
+            // through the shared reader so only one ReadLine is ever pending: a
+            // read that is still outstanding when a file arrives is reused for the
+            // confirmation prompt below instead of swallowing the next typed line.
+            string? filePath = null;
+            while (true)
+            {
+                var lineTask = NextLine();
+                var finished = await Task.WhenAny((Task)fileTcs.Task, lineTask);
+                if (finished == fileTcs.Task)
+                {
+                    filePath = fileTcs.Task.Result;
+                    break;
+                }
+
+                var typed = (await lineTask)?.Trim();
+                pendingLine = null;
+                // End of input counts as skip, anything else except "skip" is ignored
+                if (typed is null || string.Equals(typed, "skip", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
 
             if (filePath is null)
             {
@@ -596,11 +598,14 @@ internal class Program
             if (!isMatch)
             {
                 Console.Write($"  Is \"{detectedName}\" the correct file for {mod.DisplayName}? [Y/n]: ");
-                var answer = Console.ReadLine()?.Trim();
+                var answer = (await ReadLineAsync())?.Trim();
                 if (string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(answer, "no", StringComparison.OrdinalIgnoreCase))
+                    string.Equals(answer, "no", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(answer, "skip", StringComparison.OrdinalIgnoreCase))
                 {
                     WriteLine("  Skipped.", ConsoleColor.Yellow);
+                    // Remove the rejected file so it is not offered again for the next mod
+                    try { File.Delete(filePath); } catch { }
                     continue;
                 }
             }
@@ -625,6 +630,20 @@ internal class Program
         try { Directory.Delete(stagingDir, true); } catch { }
 
         return results;
+    }
+
+    // Single shared console reader: at most one ReadLine is outstanding at any time,
+    // so a read that was started while waiting for a file can never steal a line
+    // meant for a later prompt.
+    static Task<string?>? pendingLine;
+
+    static Task<string?> NextLine() => pendingLine ??= Task.Run(Console.ReadLine);
+
+    static async Task<string?> ReadLineAsync()
+    {
+        var line = await NextLine();
+        pendingLine = null;
+        return line;
     }
 
     static bool IsFuzzyMatch(string actual, string expected)
