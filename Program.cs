@@ -348,9 +348,13 @@ internal class Program
         {
             Write($"Output file already exists: ", ConsoleColor.Yellow);
             Console.WriteLine(outputPath);
+            // A line typed during manual recovery (e.g. a late "skip") must not answer this prompt
+            DiscardStaleLine();
             Console.Write("Overwrite? [Y/n]: ");
             var answer = (await ReadLineAsync())?.Trim();
-            if (string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
+            // "No" (or end of input) keeps the existing file and writes to a new name
+            if (answer is null ||
+                string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(answer, "no", StringComparison.OrdinalIgnoreCase))
             {
                 var dir = Path.GetDirectoryName(outputPath) ?? ".";
@@ -599,7 +603,9 @@ internal class Program
             {
                 Console.Write($"  Is \"{detectedName}\" the correct file for {mod.DisplayName}? [Y/n]: ");
                 var answer = (await ReadLineAsync())?.Trim();
-                if (string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
+                // End of input (null) must not count as confirmation
+                if (answer is null ||
+                    string.Equals(answer, "n", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(answer, "no", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(answer, "skip", StringComparison.OrdinalIgnoreCase))
                 {
@@ -638,6 +644,13 @@ internal class Program
     static Task<string?>? pendingLine;
 
     static Task<string?> NextLine() => pendingLine ??= Task.Run(Console.ReadLine);
+
+    // Drops a line that was already typed before the current prompt was shown.
+    static void DiscardStaleLine()
+    {
+        if (pendingLine is { IsCompleted: true })
+            pendingLine = null;
+    }
 
     static async Task<string?> ReadLineAsync()
     {
