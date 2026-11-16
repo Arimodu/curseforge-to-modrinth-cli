@@ -51,7 +51,7 @@ cursetomod MyModpack.zip
 cursetomod MyModpack.zip converted/MyModpack.mrpack
 
 # Provide API key inline (skips the stored key)
-cursetomod MyModpack.zip --cf-api-key YOUR_KEY_HERE
+cursetomod MyModpack.zip --cf-api-key 'YOUR_KEY_HERE'
 ```
 
 ### Options
@@ -70,6 +70,25 @@ Yeah, you need one of these. CurseForge requires an API key to access their file
 4. Paste it when cursetomod asks
 
 The key is validated before being saved, so you won't accidentally store a typo. It's persisted to `%APPDATA%/cursetomod/config.json` (Windows) or `~/.config/cursetomod/config.json` (Linux) so you only have to do this once.
+
+> **Quote the key on the command line.** CurseForge keys look like `$2a$10$…`. PowerShell and bash treat `$2a` and `$10` as variables and silently remove them unless the key is in **single quotes** (`'$2a$10$…'`). Typing or pasting the key at the interactive prompt has no such problem.
+
+### "Testing API key… rejected (HTTP 403)"
+
+CurseForge answers keys it does not accept with an empty `403 Forbidden`. cursetomod sends the key exactly as CurseForge expects (`x-api-key` header), so a 403 means CurseForge itself rejected it. Things that help:
+
+- copy the key again with the copy button in the console (not by selecting the text)
+- regenerate the key and use the new one
+- make sure your CurseForge for Studios account/organization is fully set up
+- wait a few minutes if you've been hammering the API
+
+You can check a key without cursetomod (PowerShell; note the single quotes):
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}`n" -H 'x-api-key: YOUR_KEY_HERE' https://api.curseforge.com/v1/games
+```
+
+`200` = key works, `403` = CurseForge rejects the key. If cursetomod instead says *could not reach api.curseforge.com*, it's a network problem (firewall, proxy, antivirus HTTPS scanning) and the exact error is printed.
 
 If you don't want to bother, type `ignore` at the prompt and cursetomod will skip the CurseForge API entirely — but every single mod will need to be manually downloaded. Not recommended unless you really enjoy suffering.
 

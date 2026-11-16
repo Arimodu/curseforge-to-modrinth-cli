@@ -88,6 +88,7 @@ internal class Program
         if (cliApiKey != null)
         {
             Console.Write("Testing provided API key... ");
+            cliApiKey = SanitizeApiKey(cliApiKey);
             if (await TestApiKey(cliApiKey))
             {
                 WriteLine("valid!", ConsoleColor.Green);
@@ -95,7 +96,6 @@ internal class Program
             }
             else
             {
-                WriteLine("invalid or unreachable.", ConsoleColor.Red);
                 WriteLine("Falling back to stored/prompted key.", ConsoleColor.Yellow);
                 Console.WriteLine();
             }
@@ -114,8 +114,7 @@ internal class Program
                 }
                 else
                 {
-                    WriteLine("invalid or unreachable.", ConsoleColor.Red);
-                    WriteLine("Stored key no longer works.", ConsoleColor.Yellow);
+                    WriteLine($"Stored key no longer works ({ConfigPath}).", ConsoleColor.Yellow);
                     Console.WriteLine();
                 }
             }
@@ -155,7 +154,7 @@ internal class Program
         Console.WriteLine();
 
         // Batch-fetch file metadata from CurseForge
-        using var http = new HttpClient();
+        using var http = CreateHttpClient();
         http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         var allFileIds = manifest.Files.Select(f => f.FileID).ToList();
@@ -164,7 +163,7 @@ internal class Program
         if (apiKey != null)
         {
             Console.WriteLine("Fetching file info from CurseForge API...");
-            http.DefaultRequestHeaders.Add("x-api-key", apiKey);
+            http.DefaultRequestHeaders.TryAddWithoutValidation("x-api-key", apiKey);
 
             // Batch in chunks of 50
             foreach (var chunk in allFileIds.Chunk(50))
@@ -245,7 +244,23 @@ internal class Program
             if (!cfFileLookup.TryGetValue(mf.FileID, out var cfFile))
             {
                 Console.Write($"{prefix} ");
-                WriteLine($"FileID {mf.FileID} — not found in CurseForge response, skipping.", ConsoleColor.Yellow);
+                if (apiKey is null)
+                {
+                    // No API key: we know nothing about the file except its IDs,
+                    // so hand it to manual download instead of dropping it.
+                    WriteLine($"Project {mf.ProjectID}, file {mf.FileID} — no API key, queued for manual download.", ConsoleColor.DarkYellow);
+                    failedMods.Add(new FailedMod
+                    {
+                        ProjectID = mf.ProjectID,
+                        FileID = mf.FileID,
+                        FileName = "",
+                        DisplayName = $"Project {mf.ProjectID} / File {mf.FileID}"
+                    });
+                }
+                else
+                {
+                    WriteLine($"FileID {mf.FileID} — not found in CurseForge response, skipping.", ConsoleColor.Yellow);
+                }
                 continue;
             }
 
@@ -299,15 +314,13 @@ internal class Program
             Console.WriteLine();
             WriteLine($"\u26a0 {failedMods.Count} mod(s) could not be downloaded automatically.", ConsoleColor.Yellow);
             var recovered = await ManualRecovery(failedMods);
-            foreach (var (fileName, data) in recovered)
+            foreach (var (fileName, _, data) in recovered)
             {
                 bundledMods.Add((fileName, data));
                 bundledCount++;
             }
             // Remove recovered from failed count
-            int recoveredCount = recovered.Count;
-            failedMods.RemoveAll(f => recovered.Any(r =>
-                string.Equals(r.FileName, f.FileName, StringComparison.OrdinalIgnoreCase)));
+            failedMods.RemoveAll(f => recovered.Any(r => r.FileID == f.FileID));
         }
 
         // Build modrinth.index.json
@@ -491,9 +504,9 @@ internal class Program
         return null;
     }
 
-    static async Task<List<(string FileName, byte[] Data)>> ManualRecovery(List<FailedMod> failedMods)
+    static async Task<List<(string FileName, int FileID, byte[] Data)>> ManualRecovery(List<FailedMod> failedMods)
     {
-        var results = new List<(string FileName, byte[] Data)>();
+        var results = new List<(string FileName, int FileID, byte[] Data)>();
         var stagingDir = Path.Combine(Path.GetTempPath(), "cursetomod-manual");
 
         if (Directory.Exists(stagingDir))
@@ -577,7 +590,8 @@ internal class Program
             var detectedName = Path.GetFileName(filePath);
 
             // Fuzzy match: check if filename is a reasonable match
-            bool isMatch = IsFuzzyMatch(detectedName, mod.FileName);
+            // Without an API key the expected filename is unknown: ask every time.
+            bool isMatch = !string.IsNullOrEmpty(mod.FileName) && IsFuzzyMatch(detectedName, mod.FileName);
 
             if (!isMatch)
             {
@@ -594,8 +608,8 @@ internal class Program
             try
             {
                 var data = await File.ReadAllBytesAsync(filePath);
-                // Use the original expected filename for the override
-                results.Add((mod.FileName, data));
+                // Use the original expected filename for the override (if known)
+                results.Add((string.IsNullOrEmpty(mod.FileName) ? detectedName : mod.FileName, mod.FileID, data));
                 WriteLine($"  \u2713 Found: {detectedName}", ConsoleColor.Green);
 
                 // Remove the file from staging
@@ -696,6 +710,7 @@ internal class Program
                 return null;
             }
 
+            input = SanitizeApiKey(input);
             Console.Write("Testing API key... ");
             if (await TestApiKey(input))
             {
@@ -707,25 +722,98 @@ internal class Program
             }
             else
             {
-                WriteLine("invalid or unreachable.", ConsoleColor.Red);
-                WriteLine("Please check your key and try again.", ConsoleColor.Yellow);
+                WriteLine("Please check your key and try again, or type 'ignore'.", ConsoleColor.Yellow);
                 Console.WriteLine();
             }
         }
     }
 
+    const string UserAgent = "cursetomod/1.0 (+https://github.com/Arimodu/curseforge-to-modrinth-cli)";
+
+    static HttpClient CreateHttpClient()
+    {
+        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(100) };
+        // Modrinth asks every client to send a uniquely identifying User-Agent,
+        // and requests without one may get blocked. .NET sends none by default.
+        http.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
+        return http;
+    }
+
+    /// <summary>
+    /// Cleans up a pasted API key: strips whitespace, surrounding quotes and
+    /// invisible characters (zero-width spaces, BOM, NBSP) that sneak in when
+    /// copying from a web page or a terminal.
+    /// </summary>
+    static string SanitizeApiKey(string key)
+    {
+        var cleaned = new string(key.Where(c =>
+            !char.IsWhiteSpace(c) &&
+            !char.IsControl(c) &&
+            c is not ('​' or '‌' or '‍' or '⁠' or '﻿' or ' ')).ToArray());
+
+        if (cleaned.Length >= 2 &&
+            ((cleaned[0] == '"' && cleaned[^1] == '"') || (cleaned[0] == '\'' && cleaned[^1] == '\'')))
+            cleaned = cleaned[1..^1];
+
+        return cleaned;
+    }
+
     static async Task<bool> TestApiKey(string apiKey)
     {
+        apiKey = SanitizeApiKey(apiKey);
+
+        // CurseForge keys look like "$2a$10$" followed by 53 characters (60 total).
+        // A shell can silently eat the "$..." parts (e.g. PowerShell expands $2a / $10
+        // as variables when the key is passed unquoted or in double quotes).
+        if (!apiKey.StartsWith("$2a$10$") || apiKey.Length != 60)
+        {
+            WriteLine("unexpected format.", ConsoleColor.Red);
+            WriteLine($"  Got {apiKey.Length} characters starting with \"{(apiKey.Length > 7 ? apiKey[..7] : apiKey)}\".", ConsoleColor.Yellow);
+            WriteLine("  CurseForge keys start with \"$2a$10$\" and are 60 characters long.", ConsoleColor.Yellow);
+            WriteLine("  On the command line, wrap the key in single quotes: --cf-api-key '$2a$10$...'", ConsoleColor.Yellow);
+            Console.Write("  Trying it anyway... ");
+        }
+
         try
         {
-            using var http = new HttpClient();
-            http.DefaultRequestHeaders.Add("x-api-key", apiKey);
-            // Lightweight call: fetch a single well-known mod (JEI, projectId 238222)
-            var resp = await http.GetAsync("https://api.curseforge.com/v1/mods/238222");
-            return resp.IsSuccessStatusCode;
+            using var http = CreateHttpClient();
+            http.Timeout = TimeSpan.FromSeconds(20);
+            http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            // TryAddWithoutValidation: the key contains '$', '/' and '.', never let
+            // header parsing reject or alter it.
+            http.DefaultRequestHeaders.TryAddWithoutValidation("x-api-key", apiKey);
+
+            // /v1/games is the endpoint the CurseForge docs use for "is my key working?"
+            var resp = await http.GetAsync("https://api.curseforge.com/v1/games");
+            if (resp.IsSuccessStatusCode)
+                return true;
+
+            var body = (await resp.Content.ReadAsStringAsync()).Trim();
+            WriteLine($"rejected (HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}).", ConsoleColor.Red);
+            if (body.Length > 0)
+                WriteLine($"  Response: {(body.Length > 300 ? body[..300] + "…" : body)}", ConsoleColor.DarkGray);
+
+            if (resp.StatusCode == HttpStatusCode.Forbidden)
+            {
+                WriteLine("  CurseForge returns 403 for keys it does not accept. Known fixes:", ConsoleColor.Yellow);
+                WriteLine("   - Copy the key again via the copy button at https://console.curseforge.com/#/api-keys", ConsoleColor.Yellow);
+                WriteLine("   - Regenerate the key there and use the new one (old keys stop working)", ConsoleColor.Yellow);
+                WriteLine("   - Make sure your CurseForge for Studios account/organization is fully set up (name filled in, terms accepted)", ConsoleColor.Yellow);
+                WriteLine("   - Too many requests: wait a few minutes and try again", ConsoleColor.Yellow);
+            }
+            else if (resp.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                WriteLine("  Rate limited by CurseForge. Wait a few minutes and try again.", ConsoleColor.Yellow);
+            }
+            return false;
         }
-        catch
+        catch (Exception ex)
         {
+            var inner = ex;
+            while (inner.InnerException != null) inner = inner.InnerException;
+            WriteLine("could not reach api.curseforge.com.", ConsoleColor.Red);
+            WriteLine($"  {ex.GetType().Name}: {inner.Message}", ConsoleColor.Yellow);
+            WriteLine("  This is a network problem, not a key problem (firewall, proxy, antivirus HTTPS scanning, DNS, VPN).", ConsoleColor.Yellow);
             return false;
         }
     }
